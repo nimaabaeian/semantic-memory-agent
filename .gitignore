@@ -6,3 +6,4 @@ memory.db
 semantic_memory.db
 inbox/*
 !inbox/.gitkeep
+.vscode/

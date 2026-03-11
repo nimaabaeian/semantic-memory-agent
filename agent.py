@@ -36,7 +36,7 @@ from google.genai import types
 # ─── Config ────────────────────────────────────────────────────
 
 MODEL = os.getenv("MODEL", "gemini-3.1-flash-lite-preview")
-DB_PATH = os.getenv("MEMORY_DB", "memory.db")
+DB_PATH = os.getenv("MEMORY_DB", "semantic_memory.db")
 
 # Supported file types for multimodal ingestion
 TEXT_EXTENSIONS = {".txt", ".md", ".json", ".csv", ".log", ".xml", ".yaml", ".yml"}
