@@ -1,16 +1,16 @@
-# Social Robot Episode Memory Agent
+# Social Robot Semantic Memory Generator
 
-An always-on multimodal memory agent that continuously turns social-robot interaction episodes into structured, queryable memories — using [Google ADK](https://google.github.io/adk-docs/) and Gemini.
+A multimodal pipeline that turns social-robot interaction episodes into **semantic memories** — structured, queryable representations of meaning, not just raw data — using [Google ADK](https://google.github.io/adk-docs/) and Gemini.
 
 ## Origin
 
-This repository is adapted from the [Always-On Memory Agent](https://github.com/GoogleCloudPlatform/generative-ai/tree/main/gemini/agents/always-on-memory-agent) reference implementation in `GoogleCloudPlatform/generative-ai`. The original design is preserved: file watcher → LLM ingestion → SQLite memory store → periodic consolidation. This version specializes that pipeline for social robot episode memory generation, with targeted changes to ingestion prompts, file routing, importance scoring, and consolidation output.
+This repository is adapted from the [Always-On Memory Agent](https://github.com/GoogleCloudPlatform/generative-ai/tree/main/gemini/agents/always-on-memory-agent) reference implementation in `GoogleCloudPlatform/generative-ai`. That design (file watcher → LLM ingestion → SQLite store → periodic consolidation) is repurposed here specifically for social robot semantic memory generation, with targeted changes to ingestion prompts, file routing, importance scoring, and consolidation output.
 
 This project is not affiliated with or endorsed by Google.
 
 ## Why This Exists
 
-Social robots accumulate rich interaction data — structured episode logs, conversation transcripts, audio recordings, and video footage — but have no standard way to turn that data into durable, queryable memory. This agent provides a lightweight, always-running process that ingests those episode files and builds a growing memory of who the robot has interacted with, what happened, and what patterns emerge over time.
+Social robots accumulate rich interaction data — structured episode logs, conversation transcripts, audio recordings, and video footage — but have no standard way to turn that raw data into durable **semantic memory**. Semantic memory captures the *meaning* of interactions: who was involved, what was said or expressed, what preferences or emotions were present, and what patterns emerge across episodes. This pipeline ingests episode files and uses Gemini to generate exactly that — structured semantic memories stored in SQLite and queryable at any time.
 
 ## How It Works
 
@@ -30,10 +30,10 @@ inbox/
                                         HTTP API  :8888
 ```
 
-1. **Watch** — the agent polls `./inbox/` every 5 seconds for new files.
-2. **Ingest** — each file is routed by type and sent to the `ingest_agent` with a social-episode-aware prompt. The agent extracts a structured memory and writes it to SQLite.
+1. **Watch** — polls `./inbox/` every 5 seconds for new files.
+2. **Ingest** — each file is routed by type and sent to the `ingest_agent` with a social-episode-aware prompt. Gemini extracts a structured memory and writes it to SQLite.
 3. **Consolidate** — every 30 minutes the `consolidate_agent` reads unconsolidated memories, finds cross-episode patterns, and writes a higher-level insight record.
-4. **Query** — the HTTP API or CLI lets you query memories and consolidation history at any time.
+4. **Query** — the HTTP API lets you query the generated memories and consolidation history at any time.
 
 ## Supported Input Types
 
@@ -99,9 +99,10 @@ python agent.py
 ```
 
 Default behavior:
-- Watches `./inbox/` for new files
-- Consolidates every 30 minutes
-- Serves the HTTP API at `http://localhost:8888`
+- Watches `./inbox/` for new episode files
+- Generates memories via Gemini LLM within 5 seconds of each file drop
+- Consolidates cross-episode insights every 30 minutes
+- Serves the memory query API at `http://localhost:8888`
 
 ### 4. Drop episode files into inbox
 
@@ -212,7 +213,7 @@ Each consolidation produces one record with a synthesized summary, one actionabl
 ## Built With
 
 - [Google ADK](https://google.github.io/adk-docs/) — agent orchestration and multi-agent routing
-- [Gemini 3.1 Flash-Lite](https://ai.google.dev/gemini-api/docs/models) — LLM for ingestion, consolidation, and query
+- [Gemini 3.1 Flash-Lite](https://ai.google.dev/gemini-api/docs/models) — LLM for memory generation, consolidation, and query
 - [SQLite](https://www.sqlite.org/) — persistent memory store
 - [aiohttp](https://docs.aiohttp.org/) — async HTTP API
 - [Streamlit](https://streamlit.io/) — optional dashboard UI
