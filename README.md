@@ -1,121 +1,86 @@
-<p align="center">
-  <img src="docs/gemini_flash_lite_agent_banner.jpeg" alt="Always-On Agent Memory Layer" width="100%">
-</p>
+# Social Robot Episode Memory Agent
 
-# Always On Memory Agent
+An always-on multimodal memory agent that continuously turns social-robot interaction episodes into structured, queryable memories — using [Google ADK](https://google.github.io/adk-docs/) and Gemini.
 
-**An always-on AI memory agent built with [Google ADK](https://google.github.io/adk-docs/) + Gemini 3.1 Flash-Lite**
+## Origin
 
-Most AI agents have amnesia. They process information when asked, then forget everything. This project gives agents a persistent, evolving memory that runs 24/7 as a lightweight background process, continuously processing, consolidating, and connecting information.
+This repository is adapted from the [Always-On Memory Agent](https://github.com/GoogleCloudPlatform/generative-ai/tree/main/gemini/agents/always-on-memory-agent) reference implementation in `GoogleCloudPlatform/generative-ai`. The original design is preserved: file watcher → LLM ingestion → SQLite memory store → periodic consolidation. This version specializes that pipeline for social robot episode memory generation, with targeted changes to ingestion prompts, file routing, importance scoring, and consolidation output.
 
-No vector database. No embeddings. Just an LLM that reads, thinks, and writes structured memory.
+This project is not affiliated with or endorsed by Google.
 
-## The Problem
+## Why This Exists
 
-Current approaches to LLM memory fall short:
-
-| Approach | Limitation |
-|---|---|
-| **Vector DB + RAG** | Passive. Embeds once, retrieves later. No active processing. |
-| **Conversation summary** | Loses detail over time. No cross-reference. |
-| **Knowledge graphs** | Expensive to build and maintain. |
-
-The gap: No system actively consolidates information like a human brain does. Humans don't just store memories. During sleep, the brain replays, connects, and compresses information. This agent does the same thing.
-
-## Architecture
-
-![Architecture Diagram](docs/architecture.png)
-
-Each agent has its own tools for reading/writing the memory store. The orchestrator routes incoming requests to the right specialist.
+Social robots accumulate rich interaction data — structured episode logs, conversation transcripts, audio recordings, and video footage — but have no standard way to turn that data into durable, queryable memory. This agent provides a lightweight, always-running process that ingests those episode files and builds a growing memory of who the robot has interacted with, what happened, and what patterns emerge over time.
 
 ## How It Works
 
-### 1. Ingest
-
-Feed the agent **any file** — text, images, audio, video, or PDFs. The **IngestAgent** uses Gemini's multimodal capabilities to extract structured information from all of them:
-
 ```
-Input: "Anthropic reports 62% of Claude usage is code-related.
-        AI agents are the fastest growing category."
-           │
-           ▼
-   ┌─────────────────────────────────────────────┐
-   │ Summary:  Anthropic reports 62% of Claude   │
-   │           usage is code-related...          │
-   │ Entities: [Anthropic, Claude, AI agents]    │
-   │ Topics:   [AI, code generation, agents]     │
-   │ Importance: 0.8                             │
-   └─────────────────────────────────────────────┘
+inbox/
+  episode_001.json   ──► [ingest_agent]  ──► memories table (SQLite)
+  session_02.txt     ──►  Gemini LLM     ──►   │
+  audio_03.mp3       ──►  multimodal           │
+  video_04.mp4       ──►                       ▼
+                                        [consolidate_agent]  (every 30 min)
+                                               │
+                                               ▼
+                                        consolidations table
+                                        (cross-episode insights)
+                                               │
+                                               ▼
+                                        HTTP API  :8888
 ```
 
-**Supported file types (27 total):**
+1. **Watch** — the agent polls `./inbox/` every 5 seconds for new files.
+2. **Ingest** — each file is routed by type and sent to the `ingest_agent` with a social-episode-aware prompt. The agent extracts a structured memory and writes it to SQLite.
+3. **Consolidate** — every 30 minutes the `consolidate_agent` reads unconsolidated memories, finds cross-episode patterns, and writes a higher-level insight record.
+4. **Query** — the HTTP API or CLI lets you query memories and consolidation history at any time.
 
-| Category | Extensions |
+## Supported Input Types
+
+| Type | Extensions | Handling |
+|---|---|---|
+| **Episode data** | `.json` | Parsed and rendered as structured interaction prose; LLM extracts social meaning from fields |
+| **Transcripts** | `.txt` | Treated as human-robot conversation transcripts; LLM focuses on names, preferences, notable statements |
+| **Other text** | `.md`, `.csv`, `.log`, `.xml`, `.yaml`, `.yml` | Standard text ingestion with light framing |
+| **Audio** | `.mp3`, `.wav`, `.ogg`, `.flac`, `.m4a`, `.aac` | Sent multimodal; LLM extracts voices, tone, spoken content, social dynamics |
+| **Video** | `.mp4`, `.webm`, `.mov`, `.avi`, `.mkv` | Sent multimodal; LLM extracts activity, participants, key moments |
+| **Image** | `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`, `.svg` | Sent multimodal; LLM describes scene and participants |
+| **Documents** | `.pdf` | Sent multimodal; LLM extracts content |
+
+Files larger than 20 MB are skipped (Gemini inline limit).
+
+## Memory Structure
+
+Each ingested episode produces one row in the `memories` table:
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | integer | Auto-increment primary key |
+| `source` | text | Filename or `"api"` |
+| `raw_text` | text | Full LLM description of the episode |
+| `summary` | text | 1–2 sentence social summary |
+| `entities` | JSON array | People, locations, objects central to the interaction |
+| `topics` | JSON array | 2–4 interaction-type tags (e.g. `greeting`, `preference-expressed`) |
+| `connections` | JSON array | Links to related memories from consolidation |
+| `importance` | float 0–1 | Social significance score |
+| `created_at` | ISO 8601 | Ingestion timestamp (UTC) |
+| `consolidated` | boolean | Whether this memory has been consolidated |
+
+**Importance scale used by the ingest agent:**
+
+| Range | Meaning |
 |---|---|
-| Text | `.txt`, `.md`, `.json`, `.csv`, `.log`, `.xml`, `.yaml`, `.yml` |
-| Images | `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`, `.svg` |
-| Audio | `.mp3`, `.wav`, `.ogg`, `.flac`, `.m4a`, `.aac` |
-| Video | `.mp4`, `.webm`, `.mov`, `.avi`, `.mkv` |
-| Documents | `.pdf` |
-
-**Three ways to ingest:**
-- **File watcher**: Drop any supported file in the `./inbox` folder. The agent picks it up automatically.
-- **Dashboard upload**: Use the 📎 Upload button in the Streamlit dashboard.
-- **HTTP API**: `POST /ingest` with text content.
-
-### 2. Consolidate
-
-The **ConsolidateAgent** runs on a timer (default: every 30 minutes). Like the human brain during sleep, it:
-
-- Reviews unconsolidated memories
-- Finds connections between them
-- Generates cross-cutting insights
-- Compresses related information
-
-```
-Memory #1: "AI agents are growing fast but reliability is a challenge"
-Memory #2: "Q1 priority: reduce inference costs by 40%"
-Memory #3: "Current LLM memory approaches all have gaps"
-Memory #4: "Smart inbox idea: persistent AI memory for email"
-                   │
-                   ▼  ConsolidateAgent
-   ┌─────────────────────────────────────────────┐
-   │ Connections:                                │
-   │   #1 ↔ #3: Agent reliability needs better   │
-   │            memory architectures             │
-   │   #2 ↔ #1: Cost reduction enables scaling   │
-   │            agent deployment                 │
-   │   #3 ↔ #4: Smart inbox is an application    │
-   │            of reconstructive memory         │
-   │                                             │
-   │ Insight: "The bottleneck for next-gen AI    │
-   │  tools is the transition from static RAG    │
-   │  to dynamic memory systems"                 │
-   └─────────────────────────────────────────────┘
-```
-
-### 3. Query
-
-Ask any question. The **QueryAgent** reads all memories and consolidation insights, then synthesizes an answer with source citations:
-
-```
-Q: "What should I focus on?"
-
-A: "Based on your memories, prioritize:
-   1. Ship the API by March 15 [Memory 2]
-   2. The agent reliability gap [Memory 1] could be addressed
-      by the reconstructive memory approach [Memory 3]
-   3. The smart inbox concept [Memory 4] validates the
-      market need for persistent AI memory"
-```
+| 0.8 – 1.0 | Strong emotional content, first meeting, explicit preference/dislike, conflict, personal disclosure |
+| 0.5 – 0.7 | Routine but meaningful interaction, clear task completion, sustained conversation |
+| 0.2 – 0.4 | Brief or uneventful exchange with little memorable content |
 
 ## Quick Start
 
-### 1. Install
+### 1. Clone and install
 
 ```bash
-git clone https://github.com/Shubhamsaboo/always-on-memory-agent.git
-cd always-on-memory-agent
+git clone https://github.com/nimaabaeian/semantic-memory-agent.git
+cd semantic-memory-agent
 pip install -r requirements.txt
 ```
 
@@ -125,105 +90,132 @@ pip install -r requirements.txt
 export GOOGLE_API_KEY="your-gemini-api-key"
 ```
 
-Get your API key from [Vertex AI Studio](https://vertexai.google.com/) or [Google AI Studio](https://aistudio.google.com/).
+Get a key from [Google AI Studio](https://aistudio.google.com/).
 
-### 3. Start the agent
+### 3. Run the agent
 
 ```bash
 python agent.py
 ```
 
-That's it. The agent is now running:
-- Watching `./inbox/` for new files (text, images, audio, video, PDFs)
-- Consolidating every 30 minutes
-- Serving queries at `http://localhost:8888`
+Default behavior:
+- Watches `./inbox/` for new files
+- Consolidates every 30 minutes
+- Serves the HTTP API at `http://localhost:8888`
 
-### 4. Feed it information
+### 4. Drop episode files into inbox
 
-**Option A: Drop any file**
 ```bash
-echo "Some important information" > inbox/notes.txt
-cp photo.jpg inbox/
-cp meeting.mp3 inbox/
-cp report.pdf inbox/
-# Agent auto-ingests within 5-10 seconds
+cp episode_001.json inbox/
+cp session_02.txt   inbox/
+cp audio_03.mp3     inbox/
+cp video_04.mp4     inbox/
+# Each file is picked up and ingested within 5 seconds
 ```
 
-**Option B: HTTP API**
+### 5. Ingest text directly via API
+
 ```bash
 curl -X POST http://localhost:8888/ingest \
   -H "Content-Type: application/json" \
-  -d '{"text": "AI agents are the future", "source": "article"}'
+  -d '{"text": "Alex greeted the robot and asked for the weather.", "source": "manual"}'
 ```
 
-### 5. Query
+### 6. Query memories
 
 ```bash
-curl "http://localhost:8888/query?q=what+do+you+know"
+curl "http://localhost:8888/query?q=what+do+you+know+about+Alex"
 ```
 
-### 6. Dashboard (optional)
+### 7. Check status
+
+```bash
+curl http://localhost:8888/status
+```
+
+### 8. Trigger consolidation manually
+
+```bash
+curl -X POST http://localhost:8888/consolidate
+```
+
+### 9. Dashboard (optional)
 
 ```bash
 streamlit run dashboard.py
 # Opens at http://localhost:8501
 ```
 
-The Streamlit dashboard connects to the running agent and provides a visual interface for:
-- **Ingesting** text and uploading files (images, audio, video, PDFs)
-- **Querying** memory with natural language
-- **Browsing** and **deleting** stored memories
-- **Consolidating** memories on demand
+## CLI Options
+
+```
+python agent.py [--watch DIR] [--port PORT] [--consolidate-every MIN]
+
+  --watch DIR              Folder to watch for new files  (default: ./inbox)
+  --port PORT              HTTP API port                  (default: 8888)
+  --consolidate-every MIN  Consolidation interval         (default: 30)
+```
+
+Environment variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `GOOGLE_API_KEY` | — | Required. Gemini API key. |
+| `MODEL` | `gemini-3.1-flash-lite-preview` | Gemini model name. |
+| `MEMORY_DB` | `semantic_memory.db` | SQLite database path. |
 
 ## API Reference
 
-| Endpoint | Method | Description |
-|---|---|---|
-| `/status` | GET | Memory statistics (counts) |
-| `/memories` | GET | List all stored memories |
-| `/ingest` | POST | Ingest new text (`{"text": "...", "source": "..."}`) |
-| `/query?q=...` | GET | Query memory with a question |
-| `/consolidate` | POST | Trigger manual consolidation |
-| `/delete` | POST | Delete a memory (`{"memory_id": 1}`) |
-| `/clear` | POST | Delete all memories (full reset) |
-
-## CLI Options
-
-```bash
-python agent.py [options]
-
-  --watch DIR              Folder to watch (default: ./inbox)
-  --port PORT              HTTP API port (default: 8888)
-  --consolidate-every MIN  Consolidation interval (default: 30)
-```
+| Endpoint | Method | Body / Params | Description |
+|---|---|---|---|
+| `/status` | GET | — | Memory counts (total, unconsolidated, consolidations) |
+| `/memories` | GET | — | All stored memories, most recent first (limit 50) |
+| `/query` | GET | `?q=<question>` | Natural language query over memories |
+| `/ingest` | POST | `{"text": "...", "source": "..."}` | Ingest a text snippet directly |
+| `/consolidate` | POST | — | Trigger consolidation immediately |
+| `/delete` | POST | `{"memory_id": <int>}` | Delete one memory by ID |
+| `/clear` | POST | — | Delete all memories, consolidations, and inbox records |
 
 ## Project Structure
 
 ```
-always-on-memory-agent/
-├── agent.py          # Always-on ADK agent (the real thing)
-├── dashboard.py      # Streamlit UI (connects to agent API)
-├── requirements.txt  # Dependencies
-├── inbox/            # Drop any file here for auto-ingestion
-├── docs/             # Logo assets (Gemini, ADK)
-└── memory.db         # SQLite database (created automatically)
+semantic-memory-agent/
+├── agent.py            # Core agent: file watcher, ingestion, consolidation, HTTP API
+├── dashboard.py        # Streamlit UI (connects to the running agent API)
+├── requirements.txt    # Python dependencies
+├── inbox/              # Drop episode files here for auto-ingestion
+├── docs/               # Assets
+└── semantic_memory.db  # SQLite database (created automatically on first run)
 ```
 
-## Why Gemini 3.1 Flash-Lite?
+## Consolidation
 
-This agent runs continuously. Cost and speed matter more than raw intelligence for background processing:
+The consolidation agent runs on a background timer. It reads all unconsolidated memories (requires ≥ 2) and looks for:
 
-- **Fast**: Low-latency ingestion and retrieval, designed for continuous background operation
-- **Cheap**: Negligible cost per session, making 24/7 operation practical
-- **Smart enough**: Extracts structure, finds connections, synthesizes answers
+- **Recurring people** — who appears across multiple episodes and what they typically do or say
+- **Repeated interaction patterns** — common greetings, task types, conversation topics
+- **Persistent preferences or habits** — food, activities, topics the person enjoys or avoids
+- **Social tendencies** — whether someone is usually brief, talkative, task-focused, or emotionally expressive
+- **Relationship development** — whether familiarity is increasing across episodes
+- **Temporal or location patterns** — if present and consistent
+
+Each consolidation produces one record with a synthesized summary, one actionable insight for the robot, and cross-memory connection links.
+
+## Scope and Limitations
+
+- **Memory generation only.** This agent ingests episode files and builds memories. It does not control robot behavior, publish to any robot middleware, or manage robot state.
+- **No vector search.** Retrieval is full-table SQL. Works well at the scale of a single robot's interaction history; not designed for large multi-robot deployments.
+- **20 MB inline media limit.** Imposed by Gemini's inline byte API. Large audio/video files must be trimmed before being dropped in inbox.
+- **No deduplication.** The same file dropped twice will be ingested once (tracked by path in `processed_files`), but semantically duplicate content from different filenames will produce separate memory entries.
+- **Platform-agnostic.** The agent assumes the robot delivers episode files to `./inbox/`. Integration with any specific robot platform (ROS, NAOqi, etc.) is out of scope.
 
 ## Built With
 
-- [Google ADK](https://google.github.io/adk-docs/) (Agent Development Kit) for agent orchestration
-- [Gemini 3.1 Flash-Lite](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/models/gemini/3-1-flash-lite) for all LLM operations
-- SQLite for persistent memory storage
-- aiohttp for the HTTP API
-- Streamlit for the dashboard
+- [Google ADK](https://google.github.io/adk-docs/) — agent orchestration and multi-agent routing
+- [Gemini 3.1 Flash-Lite](https://ai.google.dev/gemini-api/docs/models) — LLM for ingestion, consolidation, and query
+- [SQLite](https://www.sqlite.org/) — persistent memory store
+- [aiohttp](https://docs.aiohttp.org/) — async HTTP API
+- [Streamlit](https://streamlit.io/) — optional dashboard UI
 
 ## License
 
