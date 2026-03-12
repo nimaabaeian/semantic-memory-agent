@@ -39,7 +39,11 @@ MODEL = os.getenv("MODEL", "gemini-3.1-flash-lite-preview")
 DB_PATH = os.getenv("MEMORY_DB", "semantic_memory.db")
 
 # Supported file types for multimodal ingestion
+#   JSON  → parsed as structured episode data with social-context framing
+#   .txt  → treated as human-robot interaction transcripts when applicable
+#   media → sent as multimodal bytes with social episode framing
 TEXT_EXTENSIONS = {".txt", ".md", ".json", ".csv", ".log", ".xml", ".yaml", ".yml"}
+TRANSCRIPT_EXTENSIONS = {".txt"}  # plain-text files treated as interaction transcripts
 MEDIA_EXTENSIONS = {
     # Images
     ".png": "image/png",
@@ -69,10 +73,97 @@ ALL_SUPPORTED = TEXT_EXTENSIONS | set(MEDIA_EXTENSIONS.keys())
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(message)s",
+    format="%(asctime)s %(levelname)s %(message)s",
     datefmt="[%H:%M]",
 )
 log = logging.getLogger("memory-agent")
+
+
+# ─── Episode Helpers ───────────────────────────────────────────
+
+
+def parse_json_episode(text: str, filename: str) -> str:
+    """Convert a JSON episode file into a richly annotated text prompt.
+
+    Handles dict-style single episodes and list-style episode arrays.
+    Gracefully falls back to raw text if JSON is malformed.
+    """
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+    def describe(obj, indent: int = 0) -> str:
+        """Recursively render a JSON object as readable indented prose."""
+        pad = "  " * indent
+        if isinstance(obj, dict):
+            lines = []
+            for k, v in obj.items():
+                if isinstance(v, (dict, list)):
+                    lines.append(f"{pad}{k}:")
+                    lines.append(describe(v, indent + 1))
+                else:
+                    lines.append(f"{pad}{k}: {v}")
+            return "\n".join(lines)
+        elif isinstance(obj, list):
+            items = []
+            for i, item in enumerate(obj):
+                prefix = f"{pad}[{i}] "
+                if isinstance(item, (dict, list)):
+                    items.append(prefix.rstrip())
+                    items.append(describe(item, indent + 1))
+                else:
+                    items.append(f"{prefix}{item}")
+            return "\n".join(items)
+        else:
+            return f"{pad}{obj}"
+
+    structured = describe(data)
+    header = (
+        f"=== Social Robot Episode File: {filename} ===\n"
+        "This JSON file contains structured data from a recorded human-robot interaction.\n"
+        "Extract all socially meaningful information: who participated, what happened,\n"
+        "what was said, the interaction outcome, any expressed preferences or opinions.\n\n"
+    )
+    return header + structured
+
+
+def build_text_ingest_prompt(text: str, filename: str) -> str:
+    """Return the right framing prompt for a text file based on its type."""
+    suffix = Path(filename).suffix.lower()
+
+    if suffix == ".json":
+        return parse_json_episode(text, filename)
+
+    if suffix in TRANSCRIPT_EXTENSIONS:
+        return (
+            f"=== Interaction Transcript: {filename} ===\n"
+            "This is a conversation transcript from a human-robot interaction.\n"
+            "Focus on socially meaningful content: participant names, stated preferences\n"
+            "or opinions, notable statements, emotional cues, and interaction dynamics.\n"
+            "Capture durable personal details. Avoid storing trivial filler exchanges.\n\n"
+            + text
+        )
+
+    # Generic text (markdown, log, etc.) — plain pass-through with light framing
+    return f"Source: {filename}\n\n" + text
+
+
+def build_media_ingest_prompt(filename: str, mime_type: str, size_mb: float) -> str:
+    """Return a social-episode-aware prompt for multimodal media ingestion."""
+    media_kind = mime_type.split("/")[0]  # 'audio' | 'video' | 'image'
+    return (
+        f"=== Social Robot Episode {media_kind.capitalize()} File: {filename} "
+        f"({size_mb:.1f}MB) ===\n"
+        f"This {media_kind} file is evidence from a human-robot interaction episode.\n"
+        "Analyze it for:\n"
+        "  - Participant identities and voices (if distinguishable)\n"
+        "  - Emotional tone, engagement level, and social dynamics\n"
+        "  - What was said or what activity occurred\n"
+        "  - Key social moments, outcomes, or notable exchanges\n"
+        "Extract all socially meaningful information and store it as an interaction memory.\n"
+        f"Source file: {filename}, MIME: {mime_type}"
+    )
 
 # ─── Database ──────────────────────────────────────────────────
 
@@ -142,7 +233,7 @@ def store_memory(
     db.commit()
     mid = cursor.lastrowid
     db.close()
-    log.info(f"📥 Stored memory #{mid}: {summary[:60]}...")
+    log.info(f"MEMORY stored #{mid} (importance={importance:.2f}): {summary[:80]}")
     return {"memory_id": mid, "status": "stored", "summary": summary}
 
 
@@ -224,7 +315,7 @@ def store_consolidation(
     db.execute(f"UPDATE memories SET consolidated = 1 WHERE id IN ({placeholders})", source_ids)
     db.commit()
     db.close()
-    log.info(f"🔄 Consolidated {len(source_ids)} memories. Insight: {insight[:80]}...")
+    log.info(f"CONSOLIDATE stored: {len(source_ids)} memories merged. Insight: {insight[:100]}")
     return {"status": "consolidated", "memories_processed": len(source_ids), "insight": insight}
 
 
@@ -276,7 +367,7 @@ def delete_memory(memory_id: int) -> dict:
     db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
     db.commit()
     db.close()
-    log.info(f"🗑️  Deleted memory #{memory_id}")
+    log.info(f"DELETE memory #{memory_id}")
     return {"status": "deleted", "memory_id": memory_id}
 
 
@@ -308,7 +399,7 @@ def clear_all_memories(inbox_path: str | None = None) -> dict:
                 except OSError as e:
                     log.error(f"Failed to delete {f.name}: {e}")
 
-    log.info(f"🗑️  Cleared all {mem_count} memories, deleted {files_deleted} inbox files")
+    log.info(f"CLEAR all {mem_count} memories, {files_deleted} inbox files deleted")
     return {"status": "cleared", "memories_deleted": mem_count, "files_deleted": files_deleted}
 
 
@@ -319,22 +410,37 @@ def build_agents():
     ingest_agent = Agent(
         name="ingest_agent",
         model=MODEL,
-        description="Processes raw text or media into structured memory. Call this when new information arrives.",
+        description="Processes episode data from human-robot interactions into structured memory.",
         instruction=(
-            "You are a Memory Ingest Agent. You handle ALL types of input — text, images,\n"
-            "audio, video, and PDFs. For any input you receive:\n"
-            "1. Thoroughly describe what the content contains\n"
-            "2. Create a concise 1-2 sentence summary\n"
-            "3. Extract key entities (people, companies, products, concepts, objects, locations)\n"
-            "4. Assign 2-4 topic tags\n"
-            "5. Rate importance from 0.0 to 1.0\n"
-            "6. Call store_memory with all extracted information\n\n"
-            "For images: describe the scene, objects, text, people, and any visual details.\n"
-            "For audio/video: describe the spoken content, sounds, scenes, and key moments.\n"
-            "For PDFs: extract and summarize the document content.\n\n"
-            "Use the full description as raw_text in store_memory so the context is preserved.\n"
-            "Always call store_memory. Be concise and accurate.\n"
-            "After storing, confirm what was stored in one sentence."
+            "You are a Social Episode Memory Agent for a social robot.\n"
+            "You process episode data from human-robot interactions: JSON episode files,\n"
+            "conversation transcripts, audio recordings, and video recordings.\n\n"
+            "For ANY input you receive, follow these steps:\n"
+            "1. Write a full description of what happened in this social interaction.\n"
+            "2. Write a concise 1–2 sentence summary focused on participants and social outcome.\n"
+            "3. Extract entities: full names of people, locations, objects, or concepts central\n"
+            "   to the interaction. Prefer specific names over generic labels.\n"
+            "4. Assign 2–4 topic tags that describe the interaction type and themes\n"
+            "   (e.g. 'greeting', 'task-request', 'preference-expressed', 'farewell',\n"
+            "    'emotional-support', 'information-seeking', 'shared-activity').\n"
+            "5. Rate social importance 0.0–1.0 using this scale:\n"
+            "   • 0.8–1.0: strong emotional content, first meeting, explicit preference or\n"
+            "     dislike, conflict, notable achievement, personal disclosure\n"
+            "   • 0.5–0.7: routine but meaningful interaction, clear task completion,\n"
+            "     sustained conversation with some personal content\n"
+            "   • 0.2–0.4: brief or uneventful exchange with little memorable content\n"
+            "6. Call store_memory with raw_text=full description, summary, entities,\n"
+            "   topics, importance, and source.\n\n"
+            "Focus your extraction on:\n"
+            "  - Who was involved and their relationship to the robot\n"
+            "  - What happened and how the interaction unfolded\n"
+            "  - What people said, especially preferences, opinions, personal details\n"
+            "  - The social outcome or emotional result of the interaction\n"
+            "  - Any recurring patterns, habits, or preferences clearly demonstrated\n\n"
+            "For JSON episode files: use the structured fields to build a rich social description.\n"
+            "For transcripts: emphasize names, stated preferences, notable statements, dynamics.\n"
+            "For audio/video: describe voices, emotional tone, activity, and key social moments.\n\n"
+            "Always call store_memory. After storing, confirm in one sentence what was captured."
         ),
         tools=[store_memory],
     )
@@ -342,16 +448,30 @@ def build_agents():
     consolidate_agent = Agent(
         name="consolidate_agent",
         model=MODEL,
-        description="Merges related memories and finds patterns. Call this periodically.",
+        description="Consolidates interaction memories into robot-useful social insights.",
         instruction=(
-            "You are a Memory Consolidation Agent. You:\n"
-            "1. Call read_unconsolidated_memories to see what needs processing\n"
-            "2. If fewer than 2 memories, say nothing to consolidate\n"
-            "3. Find connections and patterns across the memories\n"
-            "4. Create a synthesized summary and one key insight\n"
-            "5. Call store_consolidation with source_ids, summary, insight, and connections\n\n"
+            "You are a Social Memory Consolidation Agent for a social robot.\n"
+            "Your job is to synthesize episodic interaction memories into durable insights\n"
+            "that help the robot behave more appropriately in future interactions.\n\n"
+            "Steps:\n"
+            "1. Call read_unconsolidated_memories to retrieve pending memories.\n"
+            "2. If fewer than 2 memories exist, respond: 'Nothing to consolidate yet.'\n"
+            "3. Analyze memories for cross-episode social patterns:\n"
+            "   • Recurring people: who appears often, what they typically do or say\n"
+            "   • Repeated interaction patterns: common greetings, task requests, topics\n"
+            "   • Persistent preferences or habits: food, activities, topics they enjoy/avoid\n"
+            "   • Social tendencies: is someone usually cheerful, task-focused, brief, talkative?\n"
+            "   • Location or temporal patterns if present\n"
+            "   • Relationship development: is familiarity increasing across episodes?\n"
+            "4. Write a concise synthesized summary across all source memories.\n"
+            "5. Identify ONE key actionable insight for the robot — something concrete it can\n"
+            "   use in future interactions (e.g., 'User prefers brief responses',\n"
+            "   'Alex typically initiates with a task then transitions to small talk',\n"
+            "   'Morning interactions are usually shorter than afternoon ones').\n"
+            "6. Call store_consolidation with source_ids, summary, insight, and connections.\n\n"
             "Connections: list of dicts with 'from_id', 'to_id', 'relationship' keys.\n"
-            "Think deeply about cross-cutting patterns."
+            "Link memories where the same person, preference, or pattern recurs.\n"
+            "Prioritize connections that reveal social tendencies over coincidental links."
         ),
         tools=[read_unconsolidated_memories, store_consolidation],
     )
@@ -441,11 +561,10 @@ class MemoryAgent:
         return await self.run(msg)
 
     async def ingest_file(self, file_path: Path) -> str:
-        """Ingest a media file (image, audio, video, PDF) via multimodal."""
+        """Ingest a media file (audio, video, image, PDF) as a multimodal episode."""
         suffix = file_path.suffix.lower()
         mime_type = MEDIA_EXTENSIONS.get(suffix)
         if not mime_type:
-            # Fallback to mimetypes module
             mime_type, _ = mimetypes.guess_type(str(file_path))
             mime_type = mime_type or "application/octet-stream"
 
@@ -454,15 +573,12 @@ class MemoryAgent:
 
         # Gemini has a ~20MB inline limit; skip very large files
         if size_mb > 20:
-            log.warning(f"⚠️  Skipping {file_path.name} ({size_mb:.1f}MB) — exceeds 20MB limit")
+            log.warning(f"SKIP {file_path.name} ({size_mb:.1f} MB) — exceeds 20 MB inline limit")
             return f"Skipped: file too large ({size_mb:.1f}MB)"
 
-        prompt = (
-            f"Remember this file (source: {file_path.name}, type: {mime_type}).\n\n"
-            f"Thoroughly analyze the content of this {mime_type.split('/')[0]} file and "
-            f"extract all meaningful information for memory storage."
-        )
-        log.info(f"🔮 Ingesting {mime_type.split('/')[0]}: {file_path.name} ({size_mb:.1f}MB)")
+        media_kind = mime_type.split("/")[0]
+        prompt = build_media_ingest_prompt(file_path.name, mime_type, size_mb)
+        log.info(f"INGEST [{media_kind}] {file_path.name} ({size_mb:.1f} MB)")
         return await self.run_multimodal(prompt, file_bytes, mime_type)
 
     async def consolidate(self) -> str:
@@ -479,36 +595,45 @@ class MemoryAgent:
 
 
 async def watch_folder(agent: MemoryAgent, folder: Path, poll_interval: int = 5):
-    """Watch a folder for new files and ingest them (text, images, audio, video, PDFs)."""
+    """Watch inbox for new episode files and ingest them with type-appropriate framing.
+
+    File routing:
+      .json        → parsed as structured social robot episode data
+      .txt / .md   → treated as human-robot interaction transcripts
+      audio/video  → sent multimodal with social episode framing
+      other text   → standard text ingestion
+    """
     folder.mkdir(parents=True, exist_ok=True)
     db = get_db()
-    log.info(f"👁️  Watching: {folder}/  (supports: text, images, audio, video, PDFs)")
+    log.info(f"WATCH {folder}/")
 
     while True:
         try:
             for f in sorted(folder.iterdir()):
                 if f.name.startswith("."):
-                    continue  # skip hidden files
+                    continue
                 suffix = f.suffix.lower()
                 if suffix not in ALL_SUPPORTED:
                     continue
-                row = db.execute("SELECT 1 FROM processed_files WHERE path = ?", (str(f),)).fetchone()
-                if row:
+                if db.execute("SELECT 1 FROM processed_files WHERE path = ?", (str(f),)).fetchone():
                     continue
 
                 try:
                     if suffix in TEXT_EXTENSIONS:
-                        # Text-based files — read as string
-                        log.info(f"📄 New text file: {f.name}")
-                        text = f.read_text(encoding="utf-8", errors="replace")[:10000]
-                        if text.strip():
-                            await agent.ingest(text, source=f.name)
+                        raw = f.read_text(encoding="utf-8", errors="replace")[:12000]
+                        if not raw.strip():
+                            log.warning(f"SKIP {f.name} — empty file")
+                        else:
+                            file_type = "json-episode" if suffix == ".json" else (
+                                "transcript" if suffix in TRANSCRIPT_EXTENSIONS else "text"
+                            )
+                            log.info(f"INGEST [{file_type}] {f.name}")
+                            prompt = build_text_ingest_prompt(raw, f.name)
+                            await agent.ingest(prompt, source=f.name)
                     else:
-                        # Media files — send as multimodal bytes
-                        log.info(f"🖼️  New media file: {f.name}")
                         await agent.ingest_file(f)
                 except Exception as file_err:
-                    log.error(f"Error ingesting {f.name}: {file_err}")
+                    log.error(f"ERROR ingesting {f.name}: {file_err}")
 
                 db.execute(
                     "INSERT INTO processed_files (path, processed_at) VALUES (?, ?)",
@@ -516,7 +641,7 @@ async def watch_folder(agent: MemoryAgent, folder: Path, poll_interval: int = 5)
                 )
                 db.commit()
         except Exception as e:
-            log.error(f"Watch error: {e}")
+            log.error(f"WATCH error: {e}")
 
         await asyncio.sleep(poll_interval)
 
@@ -525,8 +650,8 @@ async def watch_folder(agent: MemoryAgent, folder: Path, poll_interval: int = 5)
 
 
 async def consolidation_loop(agent: MemoryAgent, interval_minutes: int = 30):
-    """Run consolidation periodically, like sleep cycles."""
-    log.info(f"🔄 Consolidation: every {interval_minutes} minutes")
+    """Run social memory consolidation periodically to surface cross-episode insights."""
+    log.info(f"CONSOLIDATE every {interval_minutes} min")
     while True:
         await asyncio.sleep(interval_minutes * 60)
         try:
@@ -534,13 +659,13 @@ async def consolidation_loop(agent: MemoryAgent, interval_minutes: int = 30):
             count = db.execute("SELECT COUNT(*) as c FROM memories WHERE consolidated = 0").fetchone()["c"]
             db.close()
             if count >= 2:
-                log.info(f"🔄 Running consolidation ({count} unconsolidated memories)...")
+                log.info(f"CONSOLIDATE running ({count} unconsolidated memories)")
                 result = await agent.consolidate()
-                log.info(f"🔄 {result[:100]}")
+                log.info(f"CONSOLIDATE done — {result[:120]}".rstrip())
             else:
-                log.info(f"🔄 Skipping consolidation ({count} unconsolidated memories)")
+                log.info(f"CONSOLIDATE skipped ({count} unconsolidated memories — need ≥ 2)")
         except Exception as e:
-            log.error(f"Consolidation error: {e}")
+            log.error(f"CONSOLIDATE error: {e}")
 
 
 # ─── HTTP API ──────────────────────────────────────────────────
@@ -612,12 +737,12 @@ def build_http(agent: MemoryAgent, watch_path: str = "./inbox"):
 async def main_async(args):
     agent = MemoryAgent()
 
-    log.info("🧠 Agent Memory Layer starting")
-    log.info(f"   Model: {MODEL}")
-    log.info(f"   Database: {DB_PATH}")
-    log.info(f"   Watch: {args.watch}")
-    log.info(f"   Consolidate: every {args.consolidate_every}m")
-    log.info(f"   API: http://localhost:{args.port}")
+    log.info("Social Robot Episode Memory Agent starting")
+    log.info(f"  Model    : {MODEL}")
+    log.info(f"  Database : {DB_PATH}")
+    log.info(f"  Inbox    : {args.watch}")
+    log.info(f"  Consolidate every {args.consolidate_every} min")
+    log.info(f"  API      : http://localhost:{args.port}")
     log.info("")
 
     # Start background tasks
@@ -633,8 +758,8 @@ async def main_async(args):
     site = web.TCPSite(runner, "0.0.0.0", args.port)
     await site.start()
 
-    log.info(f"✅ Agent running. Drop files in {args.watch}/ or POST to http://localhost:{args.port}/ingest")
-    log.info(f"   Supported: text, images, audio, video, PDFs")
+    log.info(f"Ready — drop episode files in {args.watch}/ or POST to http://localhost:{args.port}/ingest")
+    log.info("  Accepted: .json (episode), .txt (transcript), audio, video, image, PDF")
     log.info("")
 
     # Wait forever
@@ -670,7 +795,7 @@ def main():
         pass
     finally:
         loop.close()
-        log.info("🧠 Agent stopped.")
+        log.info("Agent stopped.")
 
 
 if __name__ == "__main__":
