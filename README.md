@@ -1,5 +1,7 @@
 # Social Robot Semantic Memory Generator
 
+![Gemini Flash-Lite Agent Banner](docs/gemini_flash_lite_agent_banner.jpeg)
+
 A multimodal pipeline that turns social-robot interaction episodes into **semantic memories** — structured, queryable representations of meaning, not just raw data — using [Google ADK](https://google.github.io/adk-docs/) and Gemini.
 
 ## Origin
@@ -31,6 +33,8 @@ inbox/
                                                     ▼
                                             HTTP API  :8888
 ```
+
+![System Architecture](docs/architecture.png)
 
 1. **Watch** — polls `./inbox/` every 5 seconds for new files.
 2. **Ingest** — each file is routed by type and sent to the `ingest_agent` with a social-episode-aware prompt. Gemini extracts a structured episodic memory and writes it to the `memories` table.
@@ -261,6 +265,9 @@ Each consolidation produces one record with a synthesized summary, one actionabl
 - **Platform-agnostic.** The agent assumes the robot delivers episode files to `./inbox/`. Integration with any specific robot platform (ROS, NAOqi, etc.) is out of scope.
 
 ## Built With
+
+![Google ADK](docs/adk_logo.png)
+![Gemini](docs/Gemini_logo.png)
 
 - [Google ADK](https://google.github.io/adk-docs/) — agent orchestration and multi-agent routing
 - [Gemini 3.1 Flash-Lite](https://ai.google.dev/gemini-api/docs/models) — LLM for memory generation, fact extraction, consolidation, and query
